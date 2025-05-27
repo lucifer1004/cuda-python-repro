@@ -1,0 +1,45 @@
+# CUDA Compilation Justfile
+# Architecture: sm_90a with all optimizations enabled
+
+# Variables
+nvcc := if `which pixi > /dev/null 2>&1; echo $?` == "0" { "pixi run nvcc" } else { "nvcc" }
+python := if `which pixi > /dev/null 2>&1; echo $?` == "0" { "pixi run python" } else { "python" }
+arch := "compute_90a"
+code := "sm_90a"
+includes := "-I. -I../3rdparty/cutlass/include"
+optimization_flags := "-O3"
+
+# Default recipe
+default: build benchmark
+
+# Update submodule
+submodule:
+	git submodule update --init --recursive
+
+# Compile kernel.cu into a cubin file
+cubin: submodule
+	{{nvcc}} -gencode=arch={{arch}},code={{code}} {{optimization_flags}} {{includes}} -cubin -o kernel.cubin kernel.cu
+
+# Compile wrapped_kernel.cu into a shared library
+so: submodule
+	{{nvcc}} -gencode=arch={{arch}},code={{code}} {{optimization_flags}} {{includes}} -shared -Xcompiler -fPIC -o libwrapped_kernel.so wrapped_kernel.cu
+
+# Compile both
+build: cubin so
+
+# Format code
+fmt:
+	{{python}} -m isort .
+	{{python}} -m autopep8 --in-place --recursive .
+
+# Run benchmark
+benchmark:
+	{{python}} main.py
+
+# Profiling
+profile:
+	nsys profile -o nsys -f true -t nvtx,cuda,osrt {{python}} main.py
+
+# Clean targets
+clean:
+	rm -f kernel.cubin libwrapped_kernel.so
