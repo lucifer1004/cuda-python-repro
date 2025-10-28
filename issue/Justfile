@@ -1,31 +1,36 @@
 # CUDA Compilation Justfile
 # Architecture: sm_90a with all optimizations enabled
+#
+# Usage:
+#   just           - Build with cu12 environment (default)
+#   just cu12      - Build with cu12 environment
+#   just cu13      - Build with cu13 environment
+#   PIXI_ENV=cu13 just build - Override environment
 
 # Variables
-nvcc := if `which pixi > /dev/null 2>&1; echo $?` == "0" { "pixi run nvcc" } else { "nvcc" }
-python := if `which pixi > /dev/null 2>&1; echo $?` == "0" { "pixi run python" } else { "python" }
+pixi_env := env_var_or_default("PIXI_ENV", "cu12")
+nvcc := if `which pixi > /dev/null 2>&1; echo $?` == "0" { "pixi run -e " + pixi_env + " nvcc" } else { "nvcc" }
+python := if `which pixi > /dev/null 2>&1; echo $?` == "0" { "pixi run -e " + pixi_env + " python" } else { "python" }
 arch := "compute_90a"
 code := "sm_90a"
-includes := "-I. -I../3rdparty/cutlass/include"
 optimization_flags := "-O3"
 
 # Default recipe
 default: build benchmark
 
-# Update submodule
-submodule:
-	git submodule update --init --recursive
+# Environment-specific targets
+cu12:
+	PIXI_ENV=cu12 just build benchmark
 
-# Compile kernel.cu into a cubin file
-cubin: submodule
-	{{nvcc}} -gencode=arch={{arch}},code={{code}} {{optimization_flags}} {{includes}} -cubin -o kernel.cubin kernel.cu
+cu13:
+	PIXI_ENV=cu13 just build benchmark
 
 # Compile wrapped_kernel.cu into a shared library
-so: submodule
-	{{nvcc}} -gencode=arch={{arch}},code={{code}} {{optimization_flags}} {{includes}} -shared -Xcompiler -fPIC -o libwrapped_kernel.so wrapped_kernel.cu
+so:
+	{{nvcc}} -gencode=arch={{arch}},code={{code}} {{optimization_flags}} -shared -Xcompiler -fPIC -lcuda -o libwrapped_kernel.so wrapped_kernel.cu
 
-# Compile both
-build: cubin so
+# Build
+build: so
 
 # Format code
 fmt:
@@ -42,4 +47,4 @@ profile:
 
 # Clean targets
 clean:
-	rm -f kernel.cubin libwrapped_kernel.so
+	rm -f libwrapped_kernel.so

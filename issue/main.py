@@ -1,36 +1,32 @@
 import ctypes
+import time
 import subprocess
 import sys
 
 import cuda.bindings
-import cuda.bindings.driver as cuda_driver
+from cuda.bindings.driver import (
+    cuInit, CUdevice, cuCtxCreate,
+    cuTensorMapEncodeTiled,
+    CUtensorMapDataType, cuuint64_t, cuuint32_t,
+    CUtensorMapInterleave, CUtensorMapSwizzle,
+    CUtensorMapL2promotion, CUtensorMapFloatOOBfill,
+    CUresult
+)
 import torch
 
-import kernel
 
-
-def load_cubin_and_get_kernel(cubin_path, kernel_name):
-    """Load CUBIN file and get kernel function using CUDA driver API"""
-    # Initialize CUDA driver
-    cuda_driver.cuInit(0)
-
-    # Get device and create context
-    device = cuda_driver.CUdevice(0)
-    context = cuda_driver.cuCtxCreate(0, device)[1]
-
-    # Load CUBIN file
-    with open(cubin_path, "rb") as f:
-        cubin_data = f.read()
-
-    # Load module from CUBIN data
-    library = cuda_driver.cuLibraryLoadFromFile(
-        bytes(cubin_path, "utf-8"), [], [], 0, [], [], 0)[1]
-
-    # Get kernel function
-    kernel_func = cuda_driver.cuLibraryGetKernel(
-        library, kernel_name.encode())[1]
-
-    return {kernel_name: kernel_func}, context
+def init_cuda():
+    """Initialize CUDA driver"""
+    cuInit(0)
+    device = CUdevice(0)
+    # Need to detect cuda version here and create context with the correct flags
+    if cuda.bindings.__version__.split(".")[0] == "13":
+        res, context = cuCtxCreate(None, 0, device)
+    else:
+        res, context = cuCtxCreate(0, device)
+    if res != CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"Failed to create CUDA context: {res}")
+    return device, context
 
 
 def load_shared_library(so_path):
@@ -39,136 +35,110 @@ def load_shared_library(so_path):
 
 
 def create_test_tensors():
-    """Create test tensors for benchmarking"""
-    # Create tensors with the expected dimensions (512x512) and half precision
+    """Create test tensors"""
     A = torch.randn(512, 512, dtype=torch.float16, device='cuda')
     B = torch.randn(512, 512, dtype=torch.float16, device='cuda')
     C = torch.zeros(512, 512, dtype=torch.float16, device='cuda')
     return A, B, C
 
 
-def benchmark_cubin_approach(num_iterations=100, warmup_iterations=10):
-    """Benchmark the kernel.py + kernel.cubin approach"""
-    print("Benchmarking CUBIN approach (kernel.py + kernel.cubin)...")
-
-    # Load CUBIN and get kernel
-    kernels, context = load_cubin_and_get_kernel("kernel.cubin", "main_kernel")
-
-    # Create test tensors
-    A, B, C = create_test_tensors()
-
-
-    # Warmup runs
-    print(f"Running {warmup_iterations} warmup iterations...")
-    for _ in range(warmup_iterations):
-        kernel.call(kernels, A, B, C)
-
-    # Benchmark runs with separate event pairs for each iteration
-    print(f"Running {num_iterations} benchmark iterations...")
-    torch.cuda.synchronize()
-
-    iteration_times = []
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+def benchmark_python_tma_creation(A, B, C, num_iterations=1000):
+    """Benchmark TMA descriptor creation in Python"""
+    print(f"Benchmarking Python TMA descriptor creation ({num_iterations} iterations)...")
     
-    for i in range(num_iterations):
-        # Record start event
-        start_event.record()
+    # Get tensor pointers once
+    A_ptr = A.data_ptr()
+    B_ptr = B.data_ptr()
+    C_ptr = C.data_ptr()
+    
+    # Pre-create constant parameters (avoid repeated construction overhead)
+    data_type = CUtensorMapDataType(6)
+    rank = 2
+    global_dim = [cuuint64_t(512), cuuint64_t(512)]
+    global_stride = [cuuint64_t(1024)]
+    box_dim = [cuuint32_t(64), cuuint32_t(64)]
+    element_strides = [cuuint32_t(1), cuuint32_t(1)]
+    interleave = CUtensorMapInterleave(0)
+    swizzle_3 = CUtensorMapSwizzle(3)
+    swizzle_0 = CUtensorMapSwizzle(0)
+    l2_promotion = CUtensorMapL2promotion(2)
+    oob_fill = CUtensorMapFloatOOBfill(0)
+    
+    # Ensure GPU is idle before starting timing
+    torch.cuda.synchronize()
+    
+    start = time.perf_counter()
+    
+    for _ in range(num_iterations):
+        # Create A descriptor
+        res, A_desc = cuTensorMapEncodeTiled(
+            data_type, rank, A_ptr, global_dim, global_stride,
+            box_dim, element_strides, interleave, swizzle_3,
+            l2_promotion, oob_fill
+        )
+        if res != CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"Failed to create A_desc: {res}")
         
-        # Execute kernel
-        kernel.call(kernels, A, B, C)
+        # Create B descriptor
+        res, B_desc = cuTensorMapEncodeTiled(
+            data_type, rank, B_ptr, global_dim, global_stride,
+            box_dim, element_strides, interleave, swizzle_3,
+            l2_promotion, oob_fill
+        )
+        if res != CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"Failed to create B_desc: {res}")
         
-        # Record end event
-        end_event.record()
-        torch.cuda.synchronize()
-        
-        # Calculate elapsed time for this iteration
-        elapsed_ms = start_event.elapsed_time(end_event)
-        iteration_times.append(elapsed_ms / 1000.0)  # Convert to seconds
-
-    # Calculate statistics
-    total_time = sum(iteration_times)
+        # Create C descriptor
+        res, C_desc = cuTensorMapEncodeTiled(
+            data_type, rank, C_ptr, global_dim, global_stride,
+            box_dim, element_strides, interleave, swizzle_0,
+            l2_promotion, oob_fill
+        )
+        if res != CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"Failed to create C_desc: {res}")
+    
+    end = time.perf_counter()
+    total_time = end - start
     avg_time = total_time / num_iterations
-
+    
     return total_time, avg_time
 
 
-def benchmark_shared_library_approach(num_iterations=100, warmup_iterations=10):
-    """Benchmark the libwrapped_kernel.so approach"""
-    print("Benchmarking shared library approach (libwrapped_kernel.so)...")
-
+def benchmark_cpp_tma_creation(A, B, C, num_iterations=1000):
+    """Benchmark TMA descriptor creation in C++ (measured from Python side)"""
+    print(f"Benchmarking C++ TMA descriptor creation ({num_iterations} iterations)...")
+    
     # Load shared library
     lib = load_shared_library("./libwrapped_kernel.so")
-
-    # Set up function signatures
-    lib.init.restype = ctypes.c_int
-    lib.call.restype = ctypes.c_int
-    lib.call.argtypes = [ctypes.c_void_p,
-                         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-    lib.get_last_error.restype = ctypes.c_char_p
-
-    # Initialize the library
-    init_result = lib.init()
-    if init_result != 0:
-        error_msg = lib.get_last_error().decode('utf-8')
-        raise RuntimeError(f"Failed to initialize shared library: {error_msg}")
-
-    # Create test tensors
-    A, B, C = create_test_tensors()
-
-    # Create CUDA stream
-    stream = torch.cuda.current_stream().cuda_stream
-
+    
+    # Set up function signatures for benchmark function
+    lib.benchmark_tma_creation.restype = None
+    lib.benchmark_tma_creation.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int
+    ]
+    
     # Get tensor data pointers
     A_ptr = A.data_ptr()
     B_ptr = B.data_ptr()
     C_ptr = C.data_ptr()
-
-    # Warmup runs
-    print(f"Running {warmup_iterations} warmup iterations...")
-    for _ in range(warmup_iterations):
-        result = lib.call(A_ptr, B_ptr, C_ptr, stream)
-        if result != 0:
-            error_msg = lib.get_last_error().decode('utf-8')
-            raise RuntimeError(f"Kernel call failed: {error_msg}")
-        torch.cuda.synchronize()
-
-    # Benchmark runs with separate event pairs for each iteration
-    print(f"Running {num_iterations} benchmark iterations...")
-    torch.cuda.synchronize()
-
-    iteration_times = []
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
     
-    for i in range(num_iterations):
-        # Record start event
-        start_event.record()
-        
-        # Execute kernel
-        result = lib.call(A_ptr, B_ptr, C_ptr, stream)
-        if result != 0:
-            error_msg = lib.get_last_error().decode('utf-8')
-            raise RuntimeError(f"Kernel call failed: {error_msg}")
-        
-        # Record end event
-        end_event.record()
-        torch.cuda.synchronize()
-        
-        # Calculate elapsed time for this iteration
-        elapsed_ms = start_event.elapsed_time(end_event)
-        iteration_times.append(elapsed_ms / 1000.0)  # Convert to seconds
-
-    # Calculate statistics
-    total_time = sum(iteration_times)
+    # Ensure GPU is idle before starting timing
+    torch.cuda.synchronize()
+    
+    # Time the C++ function call from Python side (includes ctypes overhead)
+    start = time.perf_counter()
+    lib.benchmark_tma_creation(A_ptr, B_ptr, C_ptr, num_iterations)
+    end = time.perf_counter()
+    
+    total_time = end - start
     avg_time = total_time / num_iterations
-
+    
     return total_time, avg_time
 
 
 def benchmark():
-    """Main benchmark function comparing both approaches"""
-    print("CUDA Kernel Benchmark: Comparing CUBIN vs Shared Library Approaches")
+    """Main benchmark function comparing Python vs C++ TMA descriptor creation"""
+    print("TMA Descriptor Creation Benchmark: Python vs C++")
     print("=" * 70)
 
     # Check if CUDA is available
@@ -177,50 +147,43 @@ def benchmark():
         return
 
     print(f"Using CUDA device: {torch.cuda.get_device_name()}")
+    print(f"Python version: {sys.version.split()[0]}")
+    
+    try:
+        nvcc_version = subprocess.check_output(
+            ["nvcc", "--version"], text=True).split("\n")[-2].split()[1]
+        print(f"NVCC version: {nvcc_version}")
+    except:
+        pass
+    
+    print(f"CUDA Python version: {cuda.bindings.__version__}")
+    print()
 
-    # Python version
-    python_version = sys.version
-    print(f"Python version: {python_version}")
-
-    # NVCC Version
-    nvcc_version = subprocess.check_output(
-        ["nvcc", "--version"], text=True).split("\n")[-2].split()[1]
-    print(f"NVCC version: {nvcc_version}")
-
-    # CUDA Python version
-    cuda_python_version = cuda.bindings.__version__
-    print(f"CUDA Python version: {cuda_python_version}")
-
-    num_iterations = 100
-    warmup_iterations = 10
+    # Initialize CUDA
+    device, context = init_cuda()
+    
+    # Create test tensors
+    A, B, C = create_test_tensors()
+    
+    num_iterations = 1000
 
     try:
-        # Benchmark CUBIN approach
-        cubin_total, cubin_avg = benchmark_cubin_approach(
-            num_iterations, warmup_iterations)
-        print(
-            f"CUBIN approach - Total time: {cubin_total:.6f}s, Average time: {cubin_avg*1000:.3f}ms")
+        # Benchmark Python approach
+        py_total, py_avg = benchmark_python_tma_creation(A, B, C, num_iterations)
+        print(f"Python - Total: {py_total:.6f}s, Average: {py_avg*1e6:.3f}μs per iteration")
         print()
 
-        # Benchmark shared library approach
-        so_total, so_avg = benchmark_shared_library_approach(
-            num_iterations, warmup_iterations)
-        print(
-            f"Shared library approach - Total time: {so_total:.6f}s, Average time: {so_avg*1000:.3f}ms")
+        # Benchmark C++ approach
+        cpp_total, cpp_avg = benchmark_cpp_tma_creation(A, B, C, num_iterations)
+        print(f"C++    - Total: {cpp_total:.6f}s, Average: {cpp_avg*1e6:.3f}μs per iteration")
         print()
 
         # Compare results
         print("Performance Comparison:")
         print("-" * 30)
-        if cubin_avg < so_avg:
-            speedup = so_avg / cubin_avg
-            print(f"CUBIN approach is {speedup:.2f}x faster")
-        else:
-            speedup = cubin_avg / so_avg
-            print(f"Shared library approach is {speedup:.2f}x faster")
-
-        print(
-            f"Time difference: {abs(cubin_avg - so_avg)*1000:.3f}ms per call")
+        speedup = py_avg / cpp_avg
+        print(f"C++ is {speedup:.2f}x faster than Python")
+        print(f"Time difference: {(py_avg - cpp_avg)*1e6:.3f}μs per iteration")
 
     except Exception as e:
         print(f"Benchmark failed with error: {e}")

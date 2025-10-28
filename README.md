@@ -1,42 +1,26 @@
-# CUDA Python Issue Reproduction
+# CUDA Python TMA Descriptor Creation Benchmark
 
-This repository contains a reproduction case for **performance comparison between CUDA Python and traditional CUDA C++ approaches** for kernel invocation. The project benchmarks two fundamentally different paradigms:
-
-1. **CUDA Python approach**: Using `kernel.py` with precompiled `kernel.cubin` files via CUDA Python bindings
-2. **Traditional CUDA C++ approach**: Using `libwrapped_kernel.so` with ctypes (standard C++ CUDA runtime)
+This repository contains a **focused performance comparison of TMA (Tensor Memory Accelerator) descriptor creation** between CUDA Python bindings and native CUDA C++.
 
 ## 🎯 Purpose
 
-**The primary goal of this reproduction is to compare the performance overhead of CUDA API calls when using CUDA Python versus traditional CUDA C++ runtime.** This investigation aims to:
+**Measure and compare the overhead of `cuTensorMapEncodeTiled` API calls:**
 
-- Quantify the performance differences between CUDA Python bindings and traditional CUDA C++ approaches
-- Analyze the overhead introduced by Python-based CUDA API calls
-- Demonstrate real-world performance implications through controlled benchmarking
+- **Python**: CUDA Python bindings (`cuda.bindings.driver`)
+- **C++**: Native CUDA Driver API
 
-The repository includes performance timeline visualizations showing the execution patterns of both approaches:
-
-![CUDA Python Timeline](issue/images/cuda-python-timeline.png)
-*CUDA Python approach execution timeline*
-
-![CUDA C++ Timeline](issue/images/cuda-cpp-timeline.png)
-*Traditional CUDA C++ approach execution timeline*
+This benchmark isolates TMA descriptor creation to precisely quantify the Python binding overhead, without the noise of kernel launches or GPU execution.
 
 ## 🏗️ Repository Structure
 
 ```
 cuda-python-repro/
-├── issue/                      # Main reproduction code
-│   ├── main.py                 # Benchmark script comparing both approaches
-│   ├── kernel.py               # Python wrapper for CUBIN kernel calls
-│   ├── kernel.cu               # CUDA kernel source code
-│   ├── wrapped_kernel.cu       # CUDA wrapper for shared library
-│   ├── kernel.cubin            # Precompiled CUDA kernel (generated)
-│   ├── libwrapped_kernel.so    # Shared library (generated)
-│   ├── Makefile                # Build configuration
-│   ├── Justfile                # Just build automation
-│   └── tl_templates/           # Template files
-├── 3rdparty/
-│   └── cutlass/                # NVIDIA CUTLASS library (submodule)
+├── issue/                      # Main benchmark code
+│   ├── main.py                 # Benchmark script (Python & C++ comparison)
+│   ├── wrapped_kernel.cu       # C++ TMA descriptor benchmark
+│   ├── libwrapped_kernel.so    # Compiled shared library (generated)
+│   ├── Makefile                # Build configuration (supports cu12/cu13)
+│   └── Justfile                # Just build automation (supports cu12/cu13)
 ├── pixi.toml                   # Pixi package manager configuration
 ├── pixi.lock                   # Locked dependencies
 └── README.md                   # This file
@@ -44,18 +28,18 @@ cuda-python-repro/
 
 ## 🔧 Prerequisites
 
-- **CUDA Toolkit**: Version 12.9 or compatible
-- **GPU**: NVIDIA GPU with compute capability 9.0a (H100/H200 series)
-- **Python**: 3.8 or higher
-- **Pixi**: Package manager (recommended) or conda/pip
+- **CUDA Toolkit**: Version 12.x or 13.x
+- **GPU**: NVIDIA GPU with compute capability 9.0a (H100/H200 series) 
+- **Python**: 3.10 or higher
+- **Pixi**: Package manager (recommended)
 
 ## 🚀 Quick Start
 
 ### Using Pixi (Recommended)
 
-1. **Clone the repository with submodules**:
+1. **Clone the repository**:
    ```bash
-   git clone --recursive <repository-url>
+   git clone <repository-url>
    cd cuda-python-repro
    ```
 
@@ -64,144 +48,160 @@ cuda-python-repro/
    pixi install
    ```
 
-3. **Build and run the benchmark**:
+3. **Build and run (CUDA 12.x)**:
    ```bash
    cd issue
-   pixi run just build benchmark
+   make cu12
+   # or: just cu12
+   ```
+
+4. **Build and run (CUDA 13.x)**:
+   ```bash
+   cd issue
+   make cu13
+   # or: just cu13
    ```
 
 ### Using Manual Setup
 
-1. **Clone the repository**:
+1. **Install dependencies**:
    ```bash
-   git clone <repository-url>
-   cd cuda-python-repro
-   git submodule update --init --recursive
+   pip install cuda-python torch
    ```
 
-2. **Install dependencies**:
-   ```bash
-   pip install cuda-python>=12.9.0 torch
-   ```
-
-3. **Build and run**:
+2. **Build and run**:
    ```bash
    cd issue
-   # Compile CUDA kernels
-   nvcc -gencode=arch=compute_90a,code=sm_90a -O3 -I. -I../3rdparty/cutlass/include -cubin -o kernel.cubin kernel.cu
-   nvcc -gencode=arch=compute_90a,code=sm_90a -O3 -I. -I../3rdparty/cutlass/include -shared -Xcompiler -fPIC -o libwrapped_kernel.so wrapped_kernel.cu
-   
-   # Run benchmark
+   nvcc -gencode=arch=compute_90a,code=sm_90a -O3 -shared -Xcompiler -fPIC -lcuda -o libwrapped_kernel.so wrapped_kernel.cu
    python main.py
    ```
 
 ## 📊 Benchmark Details
 
-The benchmark performs matrix multiplication operations using both kernel invocation methods:
+The benchmark creates TMA descriptors for three 512×512 half-precision tensors:
 
-- **Matrix Size**: 512×512 with half-precision (float16)
-- **Iterations**: 100 benchmark runs with 10 warmup iterations
-- **Timing**: Uses CUDA events for precise GPU timing
-- **Metrics**: Reports total time, average time per call, and relative performance
+- **Operation**: `cuTensorMapEncodeTiled` (3 descriptors per iteration)
+- **Tensor Config**: 512×512 fp16, 64×64 tiles, swizzle 128B
+- **Iterations**: 1000 iterations
+- **Timing**: CPU-side timing with `time.perf_counter()` (Python) and `std::chrono` (C++)
+- **Metrics**: Average time per iteration (microseconds)
 
 ### Expected Output
 
 ```
-CUDA Kernel Benchmark: Comparing CUBIN vs Shared Library Approaches
+TMA Descriptor Creation Benchmark: Python vs C++
 ======================================================================
 Using CUDA device: NVIDIA H100 80GB HBM3
-Python version: 3.12.10 | packaged by conda-forge | (main, Apr 10 2025, 22:21:13) [GCC 13.3.0]
+Python version: 3.12.10
 NVCC version: cuda_12.9.r12.9/compiler.35813241_0
 CUDA Python version: 12.9.0
-Benchmarking CUBIN approach (kernel.py + kernel.cubin)...
-Running 10 warmup iterations...
-Running 100 benchmark iterations...
-CUBIN approach - Total time: 0.003878s, Average time: 0.039ms
 
-Benchmarking shared library approach (libwrapped_kernel.so)...
-Running 10 warmup iterations...
-Running 100 benchmark iterations...
-Shared library approach - Total time: 0.001214s, Average time: 0.012ms
+Benchmarking Python TMA descriptor creation (1000 iterations)...
+Python - Total: 0.123456s, Average: 123.456μs per iteration
+
+Benchmarking C++ TMA descriptor creation (1000 iterations)...
+C++    - Total: 0.012345s, Average: 12.345μs per iteration
 
 Performance Comparison:
 ------------------------------
-Shared library approach is 3.19x faster
-Time difference: 0.027ms per call
+C++ is 10.00x faster than Python
+Time difference: 111.111μs per iteration
 ```
 
 ## 🛠️ Available Commands
 
-Using Just (recommended):
+### Using Make
+
 ```bash
-just build          # Compile both CUBIN and shared library
-just cubin          # Compile only CUBIN file
-just so             # Compile only shared library
-just benchmark      # Run the performance benchmark
-just fmt            # Format Python code (requires isort and autopep8)
-just clean          # Remove compiled artifacts
-just profile        # Run the performance benchmark with nsys profiler
+make                    # Build and benchmark with cu12 (default)
+make cu12               # Build and benchmark with CUDA 12.x
+make cu13               # Build and benchmark with CUDA 13.x
+make build              # Compile shared library only
+make benchmark          # Run benchmark only
+make clean              # Remove compiled artifacts
+make fmt                # Format Python code
+make profile            # Profile with nsys
+make help               # Show all available targets
+
+# Override environment
+PIXI_ENV=cu13 make build
 ```
 
-Using Make:
+### Using Just
+
 ```bash
-make all            # Build everything
-make cubin          # Compile CUBIN
-make so             # Compile shared library
-make benchmark      # Run the performance benchmark
-make fmt            # Format Python code (requires isort and autopep8)
-make clean          # Clean artifacts
-make profile        # Run the performance benchmark with nsys profiler
+just                    # Build and benchmark with cu12 (default)
+just cu12               # Build and benchmark with CUDA 12.x
+just cu13               # Build and benchmark with CUDA 13.x
+just build              # Compile shared library only
+just benchmark          # Run benchmark only
+just clean              # Remove compiled artifacts
+just fmt                # Format Python code
+just profile            # Profile with nsys
+
+# Override environment
+PIXI_ENV=cu13 just build
 ```
 
 ## 🔍 Key Components
 
 ### `main.py`
 The main benchmark script that:
-- Loads and initializes both kernel approaches
-- Creates test tensors for matrix operations
-- Measures performance using CUDA events
-- Compares and reports results
-
-### `kernel.py`
-Python wrapper for CUBIN-based kernel invocation using CUDA driver API.
+- Initializes CUDA context (compatible with cu12/cu13)
+- Creates test tensors (512×512 fp16)
+- Benchmarks Python TMA descriptor creation via `cuTensorMapEncodeTiled`
+- Benchmarks C++ TMA descriptor creation via shared library
+- Compares and reports performance metrics
 
 ### `wrapped_kernel.cu`
-C++ wrapper that provides a C interface for the CUDA kernel, compiled into a shared library.
+C++ benchmark function that:
+- Implements `benchmark_tma_creation()` exported function
+- Creates 3 TMA descriptors per iteration using CUDA Driver API
+- Times the operations with `std::chrono`
+- Returns average time per iteration
 
-### `kernel.cu`
-The actual CUDA kernel implementation performing matrix multiplication.
+**Code size**: 97 lines (stripped down from 242 lines)
 
 ## 🐛 Troubleshooting
 
 ### Common Issues
 
-1. **CUDA not found**: Ensure CUDA toolkit is installed and `nvcc` is in PATH
-2. **Architecture mismatch**: The code targets `sm_90a` (H100/H200). Modify `arch` and `code` variables in Justfile for other GPUs
-3. **Memory errors**: Ensure sufficient GPU memory (at least 1GB recommended)
-4. **Import errors**: Verify `cuda-python` and `torch` are properly installed
+1. **`undefined symbol: cuTensorMapEncodeTiled`**: 
+   - Ensure `-lcuda` is in the compile command
+   - Rebuild: `make clean && make build`
 
-### Debug Mode
+2. **CUDA version mismatch**: 
+   - Use `make cu12` for CUDA 12.x or `make cu13` for CUDA 13.x
+   - Check: `pixi run -e cu12 nvcc --version`
 
-To enable verbose output and debugging:
-```bash
-CUDA_LAUNCH_BLOCKING=1 python main.py
-```
+3. **Architecture mismatch**: 
+   - Code targets `sm_90a` (H100/H200)
+   - For other GPUs: modify `ARCH` and `CODE` in Makefile
+
+4. **Import errors**: 
+   - Verify: `pixi run -e cu12 python -c "import cuda.bindings; print(cuda.bindings.__version__)"`
 
 ## 📝 Dependencies
 
-- **cuda-python**: >=12.9.0,<13 - CUDA Python bindings
+### CUDA 12.x Environment (cu12)
+- **cuda-python**: 12.6.x - CUDA Python bindings
 - **pytorch-gpu**: >=2.7.0,<3 - PyTorch with CUDA support
-- **cuda-toolkit**: >=12.9.0,<13 - NVIDIA CUDA Toolkit
-- **CUTLASS**: NVIDIA CUTLASS library (submodule)
+- **cuda-toolkit**: 12.6.x - NVIDIA CUDA Toolkit
+
+### CUDA 13.x Environment (cu13)
+- **cuda-python**: 13.0.x - CUDA Python bindings  
+- **pytorch-gpu**: >=2.7.0,<3 - PyTorch with CUDA support
+- **cuda-toolkit**: 13.0.x - NVIDIA CUDA Toolkit
+
+All dependencies are managed via `pixi.toml`.
 
 ## 🤝 Contributing
 
-This is a reproduction repository. If you encounter issues or have improvements:
+This is a focused benchmark repository. If you encounter issues or have improvements:
 
-1. Ensure your environment matches the prerequisites
-2. Test with the provided benchmark
-3. Document any modifications needed for different GPU architectures
-4. Report findings with system specifications
+1. Test with both `cu12` and `cu13` environments
+2. Document any modifications for different GPU architectures
+3. Report findings with system specifications and timing results
 
 ## 📄 License
 
@@ -210,5 +210,5 @@ See [LICENSE](LICENSE) file for details.
 ## 🔗 Related Links
 
 - [CUDA Python Documentation](https://nvidia.github.io/cuda-python/)
-- [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass)
-- [CUDA Toolkit Documentation](https://docs.nvidia.com/cuda/)
+- [CUDA Driver API Reference](https://docs.nvidia.com/cuda/cuda-driver-api/)
+- [TMA (Tensor Memory Accelerator) Documentation](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#tensor-memory-accelerator-tma)
